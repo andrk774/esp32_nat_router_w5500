@@ -1,0 +1,7 @@
+# USB modem mode 1: PPP / AT-command modems (Quectel EC20/EC25, SIMCom A76xx,
+# Air780E, Fibocom, ...). Chain after sdkconfig.defaults.esp32s3_usb_modem.
+CONFIG_UPLINK_USB_MODEM_PPP=y
+
+# APN: leave empty for most SIMs. Examples: internet.mts.ru,
+# internet.beeline.ru, internet (MegaFon), internet.tele2.ru
+CONFIG_USB_MODEM_APN=""

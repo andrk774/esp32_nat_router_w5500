@@ -954,7 +954,8 @@ static esp_err_t vpn_import_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    if (req->content_len == 0 || req->content_len > 4096) {
+    /* AmneziaWG I1-I5 templates can run to several KB */
+    if (req->content_len == 0 || req->content_len > 16384) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Invalid body size\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
@@ -983,10 +984,13 @@ static esp_err_t vpn_import_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     if (err == ESP_OK) {
-        httpd_resp_send(req, "{\"ok\":true,\"msg\":\"WireGuard config imported. Rebooting...\"}", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, "{\"ok\":true,\"msg\":\"VPN config imported. Rebooting...\"}", HTTPD_RESP_USE_STRLEN);
         esp_timer_start_once(restart_timer, 3000000);
     } else {
-        httpd_resp_send(req, "{\"ok\":false,\"msg\":\"Import failed: need PrivateKey, PublicKey, Endpoint and Address\"}", HTTPD_RESP_USE_STRLEN);
+        /* The messages are fixed strings without JSON specials */
+        char reply[160];
+        snprintf(reply, sizeof(reply), "{\"ok\":false,\"msg\":\"Import failed: %s\"}", vpn_import_error());
+        httpd_resp_send(req, reply, HTTPD_RESP_USE_STRLEN);
     }
     return ESP_OK;
 }
@@ -2184,7 +2188,17 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 #if CONFIG_ETH_UPLINK
     /* Chunk 5: ETH info */
     SEND_CHUNK(req,
+#if CONFIG_UPLINK_USB_MODEM_PPP
+        "<h2>Uplink Settings</h2><table><tr><td>Mode:</td><td>USB modem (PPP)</td></tr></table>",
+#elif CONFIG_USB_MODEM_NET_RNDIS
+        "<h2>Uplink Settings</h2><table><tr><td>Mode:</td><td>USB modem (RNDIS)</td></tr></table>",
+#elif CONFIG_USB_MODEM_NET_ECM
+        "<h2>Uplink Settings</h2><table><tr><td>Mode:</td><td>USB modem (ECM)</td></tr></table>",
+#elif CONFIG_ETH_PHY_SPI_W5500
+        "<h2>Uplink Settings</h2><table><tr><td>Mode:</td><td>Ethernet (W5500)</td></tr></table>",
+#else
         "<h2>Uplink Settings</h2><table><tr><td>Mode:</td><td>Ethernet (LAN8720)</td></tr></table>",
+#endif
         HTTPD_RESP_USE_STRLEN);
 #else
     /* Chunk 5: STA Settings */
@@ -3598,6 +3612,9 @@ static esp_err_t vpn_get_handler(httpd_req_t *req)
                     if (httpd_query_key_value(buf, "vpn_ks", param, sizeof(param)) == ESP_OK) {
                         nvs_set_i32(nvs, "vpn_ks", atoi(param));
                     }
+                    if (httpd_query_key_value(buf, "vpn_proto", param, sizeof(param)) == ESP_OK) {
+                        nvs_set_i32(nvs, "vpn_proto", atoi(param) ? 1 : 0);
+                    }
                     if (httpd_query_key_value(buf, "vpn_rall", param, sizeof(param)) == ESP_OK) {
                         nvs_set_i32(nvs, "vpn_rall", atoi(param));
                     }
@@ -3662,6 +3679,9 @@ static esp_err_t vpn_get_handler(httpd_req_t *req)
              ap_mss_clamp, ap_pmtu);
     SEND_CHUNK(req, row, HTTPD_RESP_USE_STRLEN);
 
+    snprintf(row, VPN_BUF_SIZE, "<tr><td>Protocol:</td><td>%s</td></tr>", vpn_proto ? "AmneziaWG" : "WireGuard");
+    SEND_CHUNK(req, row, HTTPD_RESP_USE_STRLEN);
+
     snprintf(row, VPN_BUF_SIZE, "<tr><td>Kill Switch:</td><td><strong style='color:%s;'>%s</strong></td></tr>",
              vpn_killswitch ? "#4caf50" : "#888", vpn_killswitch ? "On" : "Off");
     SEND_CHUNK(req, row, HTTPD_RESP_USE_STRLEN);
@@ -3680,6 +3700,13 @@ static esp_err_t vpn_get_handler(httpd_req_t *req)
         "<option value='1' %s>On</option><option value='0' %s>Off</option>"
         "</select></td></tr>",
         vpn_enabled ? "selected" : "", vpn_enabled ? "" : "selected");
+    SEND_CHUNK(req, row, HTTPD_RESP_USE_STRLEN);
+
+    snprintf(row, VPN_BUF_SIZE,
+        "<tr><td>Protocol</td><td><select name='vpn_proto'>"
+        "<option value='0' %s>WireGuard</option><option value='1' %s>AmneziaWG</option>"
+        "</select><br><small>AmneziaWG parameters (Jc, S1-S4, H1-H4, I1-I5) come from the imported .conf</small></td></tr>",
+        vpn_proto ? "" : "selected", vpn_proto ? "selected" : "");
     SEND_CHUNK(req, row, HTTPD_RESP_USE_STRLEN);
 
     snprintf(row, VPN_BUF_SIZE,

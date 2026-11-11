@@ -4,6 +4,10 @@ cmake_minimum_required(VERSION 3.16)
 
 set(PROJECT_VER "2.4.23")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+# Optional larger NAT table (-DROUTER_NAPT_MAX=n) for boards with PSRAM
+if(DEFINED ROUTER_NAPT_MAX)
+    idf_build_set_property(COMPILE_DEFINITIONS "IP_NAPT_MAX=${ROUTER_NAPT_MAX}" APPEND)
+endif()
 project(esp32_nat_router)
 
 # Force esp_app_desc.c to recompile on every build so that

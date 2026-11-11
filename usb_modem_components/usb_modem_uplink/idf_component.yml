@@ -1,0 +1,8 @@
+dependencies:
+  # PPP / AT-command modems
+  espressif/iot_usbh_modem: '^2.1'
+  espressif/modem_at: '*'
+  # Network-card modems (RNDIS / CDC-ECM)
+  espressif/iot_usbh_rndis: '>=0.3.1'
+  espressif/iot_usbh_ecm: '>=0.3.0'
+  espressif/iot_eth: '*'

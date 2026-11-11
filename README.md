@@ -1,3 +1,62 @@
+# ESP32 NAT Router: W5500, USB 4G modem and AmneziaWG
+
+This repository is based on [martin-ger/esp32_nat_router](https://github.com/martin-ger/esp32_nat_router)
+(commit `08da293`, v2.4.23), with its full history. Everything below this section is the original README.
+The upstream repository has no license file: the original code belongs to its author.
+No license has been chosen yet for the changes added here.
+
+Target hardware: **Waveshare ESP32-S3-ETH / ESP32-S3-POE-ETH(-M)** (ESP32-S3R8, 8 MB octal
+PSRAM, 16 MB flash, WIZnet W5500). Russian documentation: [README_RU.md](README_RU.md).
+
+## What this adds
+
+- **Ethernet uplink via WIZnet W5500 (SPI)** for chips without an RMII EMAC (ESP32-S3 and others).
+  Uses the ESP-IDF 5.x driver API and gives the W5500 the chip's own MAC address.
+- **USB 4G modem uplink** on the ESP32-S3 USB OTG port, in two modes:
+  PPP/AT-command modems (`iot_usbh_modem`) and network-card modems, RNDIS or CDC-ECM
+  (`iot_usbh_rndis` / `iot_usbh_ecm`). In PPP mode the uplink byte counter, uplink ACL and
+  packet capture work too, and VJ header compression is off (it breaks NAPT on PPP).
+- **AmneziaWG** next to WireGuard: Jc/Jmin/Jmax, S1-S4, H1-H4 (values or ranges) and
+  I1-I5 signature packets. A WireGuard or AmneziaWG `.conf` can be pasted into the VPN page.
+  Built on esp_wireguard v0.9.2 (with its GHSA security fixes), kept in `components/esp_wireguard`.
+- **Board defaults** for the Waveshare board: 16 MB partition table (two 4 MB app slots, a larger
+  NVS, a core dump partition), PSRAM for Wi-Fi/lwIP buffers, a NAT table of 1024 entries,
+  10 Wi-Fi clients, the WS2812 status LED on GPIO21, and the BOOT button factory reset.
+- **Diagnostics:** the reason for the last reset is logged at boot and shown by `show status`,
+  and a core dump is kept in flash after a crash.
+
+## Build (PlatformIO)
+
+| Environment | Internet source |
+|---|---|
+| `esp32-s3-eth-w5500` | Ethernet through the W5500 |
+| `esp32-s3-usb-modem-ppp` | USB 4G modem, PPP / AT commands |
+| `esp32-s3-usb-modem-net` | USB 4G modem, RNDIS / CDC-ECM network card |
+| `esp32-s3-eth-wifi-uplink` | another Wi-Fi network, including WPA2-Enterprise |
+
+```bash
+pio run -e esp32-s3-eth-w5500 -t upload
+```
+
+The internet source is chosen at build time; the modem builds move the console to UART0
+(IO43/IO44) because the USB port becomes a USB host.
+
+## Status
+
+- **Tested on the board:** the `esp32-s3-eth-w5500` build. The W5500 gets an address over DHCP,
+  NAT to Wi-Fi clients works, PSRAM is detected and the status LED shows the right colours.
+- **Open issue:** an Android phone on the router's Wi-Fi can't open the web UI (internet through
+  the router works).
+- **AmneziaWG:** the firmware's WireGuard code was tested on a PC against the reference
+  `amneziawg-go` server (handshake and traffic for plain WireGuard, AmneziaWG 1.0 and a full
+  S1-S4/H-range/I1-I5 profile; mismatched parameters are rejected). It has not been tested on
+  the board or against a deployed server.
+- **Not tested at all:** the USB modem builds (no modem was available) and the Wi-Fi uplink build.
+- **Not supported:** the newer `amneziawg-go` options `header_protection_key`,
+  `random_trailers` and `content_padding_addition`.
+
+---
+
 # ESP32 NAT Router
 
 This is a firmware to use the ESP32 as WiFi NAT router. It routes between the network of the AP interface and the STA or ETH interface as uplink network. It can also work as a VPN router using WireGuard as uplink.

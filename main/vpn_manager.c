@@ -4,6 +4,8 @@
  * WireGuard timestamps), and VPN subnet helpers for the kill switch.
  */
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "esp_log.h"
@@ -12,7 +14,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/ip_addr.h"
+#include "esp_netif.h"
 #include "vpn_config.h"
+#include "wifi_config.h"
 #include "router_config.h"
 #include "portmap.h"
 
@@ -26,6 +30,65 @@ static uint32_t vpn_subnet_mask = 0;
 static wireguard_config_t wg_config = ESP_WIREGUARD_CONFIG_DEFAULT();
 static wireguard_ctx_t wg_ctx = {0};
 static bool wg_initialized = false;
+
+// AmneziaWG parameters; the I1-I5 strings live as long as the firmware runs
+static wg_awg_config_t awg_config;
+
+#if CONFIG_ETH_UPLINK
+extern esp_netif_t* ethNetif;
+#endif
+
+static uint16_t awg_get_u16(const char *key)
+{
+    int value = 0;
+    get_config_param_int((char *)key, &value);
+    return (value < 0 || value > 65535) ? 65535 : (uint16_t)value;
+}
+
+/* Fails rather than falling back to plain WireGuard: an unmasked handshake is
+ * what the user is trying to avoid. */
+static esp_err_t awg_load(void)
+{
+    static bool loaded = false;
+    char key[8];
+
+    if (!loaded) {
+        wg_awg_config_init(&awg_config);
+        awg_config.jc = awg_get_u16("awg_jc");
+        awg_config.jmin = awg_get_u16("awg_jmin");
+        awg_config.jmax = awg_get_u16("awg_jmax");
+        awg_config.s1 = awg_get_u16("awg_s1");
+        awg_config.s2 = awg_get_u16("awg_s2");
+        awg_config.s3 = awg_get_u16("awg_s3");
+        awg_config.s4 = awg_get_u16("awg_s4");
+        for (int n = 0; n < 4; n++) {
+            char *text = NULL;
+            snprintf(key, sizeof(key), "awg_h%d", n + 1);
+            if (get_config_param_str(key, &text) == ESP_OK && text != NULL) {
+                if (!wg_awg_parse_range(text, &awg_config.h[n])) {
+                    ESP_LOGE(TAG, "AmneziaWG: invalid %s: %s", key, text);
+                    free(text);
+                    return ESP_ERR_INVALID_ARG;
+                }
+                free(text);
+            }
+        }
+        for (int n = 0; n < WG_AWG_SIGNATURE_PACKETS; n++) {
+            char *text = NULL;
+            snprintf(key, sizeof(key), "awg_i%d", n + 1);
+            if (get_config_param_str(key, &text) == ESP_OK && text != NULL) {
+                awg_config.i[n] = text;
+            }
+        }
+        loaded = true;
+    }
+    const char *reason = wg_awg_validate(&awg_config);
+    if (reason != NULL) {
+        ESP_LOGE(TAG, "AmneziaWG: %s", reason);
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
 
 void vpn_set_subnet(uint32_t ip, uint32_t mask) {
     vpn_subnet_ip = ip;
@@ -60,8 +123,19 @@ esp_err_t vpn_connect(void)
     wg_config.port = vpn_port;
     wg_config.persistent_keepalive = vpn_keepalive;
 #if CONFIG_ETH_UPLINK
-    wg_config.netif_key = "ETH_DEF";
+    // Works for every wired uplink: W5500/LAN8720 ("ETH_DEF") and the USB modem netifs
+    wg_config.netif_key = ethNetif ? esp_netif_get_ifkey(ethNetif) : "ETH_DEF";
 #endif
+    wg_config.awg = NULL;
+    if (vpn_proto == 1) {
+        esp_err_t awg_err = awg_load();
+        if (awg_err != ESP_OK) {
+            return awg_err;
+        }
+        wg_config.awg = &awg_config;
+        ESP_LOGI(TAG, "Protocol: AmneziaWG (Jc=%u S1=%u S2=%u S3=%u S4=%u)", awg_config.jc,
+                 awg_config.s1, awg_config.s2, awg_config.s3, awg_config.s4);
+    }
 
     esp_err_t err;
     if (!wg_initialized) {
@@ -101,11 +175,13 @@ esp_err_t vpn_connect(void)
      * non-DF inner packets (plain UDP) before encryption; the outer WG packet
      * is then at most vpn_mtu + 60 (IPv4) and fits a reduced uplink path MTU.
      * PMTU/MSS cover DF and TCP traffic from AP clients. */
+    // S4 is added to every outer packet, so it comes out of the inner MTU
+    int32_t inner_mtu = vpn_mtu - (wg_config.awg ? wg_config.awg->s4 : 0);
     if (wg_ctx.netif) {
-        wg_ctx.netif->mtu = (u16_t)vpn_mtu;
+        wg_ctx.netif->mtu = (u16_t)inner_mtu;
     }
-    ap_mss_clamp = (uint16_t)(vpn_mtu - 40);
-    ap_pmtu = (uint16_t)vpn_mtu;
+    ap_mss_clamp = (uint16_t)(inner_mtu - 40);
+    ap_pmtu = (uint16_t)inner_mtu;
     vpn_connected = true;
 
     /* Cache VPN tunnel IP and activate VPN-bound port mappings */

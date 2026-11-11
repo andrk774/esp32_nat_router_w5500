@@ -1,0 +1,11 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# 16 MB flash (Waveshare ESP32-S3-ETH). NVS is 64 KB instead of the usual 24 KB:
+# AmneziaWG I1-I5 templates can take several KB each.
+nvs,      data, nvs,     0x9000,   64K,
+otadata,  data, ota,     0x19000,  8K,
+phy_init, data, phy,     0x1B000,  4K,
+ota_0,    app,  ota_0,   0x20000,  4M,
+ota_1,    app,  ota_1,   0x420000, 4M,
+storage,  data, fat,     0x820000, 0x7D0000,
+# Core dump after a crash, read with: pio run -t ... / espcoredump.py
+coredump, data, coredump,0xFF0000, 64K,

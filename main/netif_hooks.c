@@ -181,6 +181,30 @@ static IRAM_ATTR err_t netif_input_hook(struct pbuf *p, struct netif *netif) {
 }
 
 
+static IRAM_ATTR void apply_ttl_override(struct ip_hdr *iphdr)
+{
+    // Verify it's IPv4
+    if (IPH_V(iphdr) != 4) {
+        return;
+    }
+    // Read 16-bit word containing TTL and protocol
+    uint16_t old_ttl_proto = *(uint16_t *)&iphdr->_ttl;
+    iphdr->_ttl = sta_ttl_override;
+    uint16_t new_ttl_proto = *(uint16_t *)&iphdr->_ttl;
+
+    // RFC 1624: Incremental checksum update
+    // HC' = ~(~HC + ~m + m')
+    // where HC = old checksum, m = old value, m' = new value
+    uint32_t sum = (uint16_t)~iphdr->_chksum;
+    sum += (uint16_t)~old_ttl_proto;
+    sum += new_ttl_proto;
+    // Fold 32-bit sum to 16 bits
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    iphdr->_chksum = (uint16_t)~sum;
+}
+
 // Hook function to count sent bytes via netif linkoutput and ACL check
 static IRAM_ATTR err_t netif_linkoutput_hook(struct netif *netif, struct pbuf *p) {
     bool is_acl_monitored = false;
@@ -209,26 +233,7 @@ static IRAM_ATTR err_t netif_linkoutput_hook(struct netif *netif, struct pbuf *p
         uint8_t *payload = (uint8_t *)p->payload;
         // Check ethertype for IPv4 (0x0800)
         if (payload[12] == 0x08 && payload[13] == 0x00) {
-            struct ip_hdr *iphdr = (struct ip_hdr *)(payload + 14);
-            // Verify it's IPv4
-            if (IPH_V(iphdr) == 4) {
-                // Read 16-bit word containing TTL and protocol
-                uint16_t old_ttl_proto = *(uint16_t *)&iphdr->_ttl;
-                iphdr->_ttl = sta_ttl_override;
-                uint16_t new_ttl_proto = *(uint16_t *)&iphdr->_ttl;
-
-                // RFC 1624: Incremental checksum update
-                // HC' = ~(~HC + ~m + m')
-                // where HC = old checksum, m = old value, m' = new value
-                uint32_t sum = (uint16_t)~iphdr->_chksum;
-                sum += (uint16_t)~old_ttl_proto;
-                sum += new_ttl_proto;
-                // Fold 32-bit sum to 16 bits
-                while (sum >> 16) {
-                    sum = (sum & 0xFFFF) + (sum >> 16);
-                }
-                iphdr->_chksum = (uint16_t)~sum;
-            }
+            apply_ttl_override((struct ip_hdr *)(payload + 14));
         }
     }
 
@@ -257,8 +262,131 @@ static IRAM_ATTR err_t netif_linkoutput_hook(struct netif *netif, struct pbuf *p
     return ERR_IF;
 }
 
+#if CONFIG_UPLINK_USB_MODEM_PPP
+/* lwIP's PPP netif has no linkoutput: it sends through netif->output and hands
+ * received IP packets straight to ip4_input(), bypassing netif->input. So the
+ * hooks sit there instead; ip4_input is wrapped at link time (main/CMakeLists.txt).
+ *
+ * These packets are bare IP, while the ACL and the capture format expect
+ * Ethernet frames. The ACL guesses by looking at bytes 12-13, which on an IP
+ * packet are the start of the source address and would misfire (1.1.1.1 looks
+ * like an 802.3 length field), so both get a synthetic Ethernet header. */
+#define PPP_ETH_HEADER_LEN 14
+#define PPP_ACL_VIEW_LEN   80   /* longest IP header + the ports */
+
+static netif_output_fn original_ppp_output = NULL;
+
+static IRAM_ATTR void ppp_fill_eth_header(uint8_t *hdr)
+{
+    memset(hdr, 0, 12);
+    hdr[12] = 0x08;
+    hdr[13] = 0x00;
+}
+
+static IRAM_ATTR uint8_t ppp_acl_check(uint8_t list, struct pbuf *p)
+{
+    uint8_t buf[PPP_ETH_HEADER_LEN + PPP_ACL_VIEW_LEN];
+    ppp_fill_eth_header(buf);
+    u16_t copied = pbuf_copy_partial(p, buf + PPP_ETH_HEADER_LEN, PPP_ACL_VIEW_LEN, 0);
+    struct pbuf view = {
+        .next = NULL,
+        .payload = buf,
+        .tot_len = (u16_t)(PPP_ETH_HEADER_LEN + p->tot_len),
+        .len = (u16_t)(PPP_ETH_HEADER_LEN + copied),
+    };
+    return acl_check_packet(list, &view);
+}
+
+static IRAM_ATTR void ppp_capture(struct pbuf *p)
+{
+    uint8_t hdr[PPP_ETH_HEADER_LEN];
+    ppp_fill_eth_header(hdr);
+    struct pbuf eth = {
+        .next = p,
+        .payload = hdr,
+        .tot_len = (u16_t)(PPP_ETH_HEADER_LEN + p->tot_len),
+        .len = PPP_ETH_HEADER_LEN,
+    };
+    pcap_capture_packet(&eth);
+}
+
+static IRAM_ATTR void ppp_note_traffic(void)
+{
+    if (led_gpio >= 0 && ap_connect) {
+        led_toggle ^= 1;
+        gpio_set_level(led_gpio, led_toggle ^ led_lowactive);
+    }
+    if (led_strip_gpio >= 0) {
+        led_strip_notify_traffic();
+    }
+}
+
+static IRAM_ATTR err_t ppp_output_hook(struct netif *netif, struct pbuf *p, const ip4_addr_t *ipaddr)
+{
+    bool is_acl_monitored = false;
+
+    if (!acl_is_empty(ACL_FROM_ESP)) {
+        uint8_t result = ppp_acl_check(ACL_FROM_ESP, p);
+        is_acl_monitored = (result != ACL_NO_MATCH) && (result & ACL_MONITOR) != 0;
+        if ((result & 0x01) == ACL_DENY && result != ACL_NO_MATCH) {
+            if (is_acl_monitored && pcap_should_capture(true, false)) {
+                ppp_capture(p);
+            }
+            return ERR_OK;
+        }
+    }
+    if (sta_ttl_override > 0 && p->len >= sizeof(struct ip_hdr)) {
+        apply_ttl_override((struct ip_hdr *)p->payload);
+    }
+    if (pcap_should_capture(is_acl_monitored, false)) {
+        ppp_capture(p);
+    }
+    sta_bytes_sent += p->tot_len;
+    ppp_note_traffic();
+    return original_ppp_output(netif, p, ipaddr);
+}
+
+err_t __real_ip4_input(struct pbuf *p, struct netif *inp);
+
+IRAM_ATTR err_t __wrap_ip4_input(struct pbuf *p, struct netif *inp)
+{
+    if (inp == sta_netif && sta_netif != NULL) {
+        bool is_acl_monitored = false;
+
+        if (!acl_is_empty(ACL_TO_ESP)) {
+            uint8_t result = ppp_acl_check(ACL_TO_ESP, p);
+            is_acl_monitored = (result != ACL_NO_MATCH) && (result & ACL_MONITOR) != 0;
+            if ((result & 0x01) == ACL_DENY && result != ACL_NO_MATCH) {
+                if (is_acl_monitored && pcap_should_capture(true, false)) {
+                    ppp_capture(p);
+                }
+                pbuf_free(p);
+                return ERR_OK;
+            }
+        }
+        if (pcap_should_capture(is_acl_monitored, false)) {
+            ppp_capture(p);
+        }
+        sta_bytes_received += p->tot_len;
+        ppp_note_traffic();
+    }
+    return __real_ip4_input(p, inp);
+}
+#endif /* CONFIG_UPLINK_USB_MODEM_PPP */
+
 void init_byte_counter(void) {
-#if CONFIG_ETH_UPLINK
+#if CONFIG_UPLINK_USB_MODEM_PPP
+    if (ethNetif != NULL && original_ppp_output == NULL) {
+        extern struct netif *esp_netif_get_netif_impl(esp_netif_t *esp_netif);
+        struct netif *ppp = esp_netif_get_netif_impl(ethNetif);
+        if (ppp != NULL) {
+            original_ppp_output = ppp->output;
+            ppp->output = ppp_output_hook;
+            sta_netif = ppp;    // arms __wrap_ip4_input
+            ESP_LOGI(TAG, "Byte counter initialized for PPP interface (input & output)");
+        }
+    }
+#elif CONFIG_ETH_UPLINK
     if (ethNetif != NULL && original_netif_input == NULL) {
         extern struct netif *esp_netif_get_netif_impl(esp_netif_t *esp_netif);
         sta_netif = esp_netif_get_netif_impl(ethNetif);

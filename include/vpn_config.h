@@ -35,9 +35,12 @@ extern bool vpn_connected;          // Runtime state: tunnel is up
 extern uint32_t vpn_tunnel_ip;      // Cached VPN tunnel IP (network byte order, 0 if not connected)
 extern int32_t vpn_killswitch;      // Kill switch: block AP client internet when VPN is down (default on)
 extern int32_t vpn_route_all;       // Route all traffic through VPN (1) or only VPN subnet (0, split tunnel)
+extern int32_t vpn_proto;           // 0 = WireGuard, 1 = AmneziaWG (parameters in the awg_* NVS keys)
 
 // WireGuard VPN functions
 esp_err_t vpn_connect(void);
+/* Stores a WireGuard or AmneziaWG .conf; vpn_import_error() explains a failure. */
+const char *vpn_import_error(void);
 void vpn_disconnect(void);
 bool vpn_is_connected(void);
 void vpn_connect_task(void *pvParameters);

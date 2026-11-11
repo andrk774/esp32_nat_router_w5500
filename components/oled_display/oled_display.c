@@ -28,7 +28,9 @@ extern bool ap_connect;
 extern uint16_t connect_count;
 extern uint32_t my_ip;
 extern uint32_t my_ap_ip;
+#if !CONFIG_ETH_UPLINK
 extern char *ssid;
+#endif
 extern char *ap_ssid;
 extern uint64_t sta_bytes_sent;
 extern uint64_t sta_bytes_received;
@@ -267,7 +269,11 @@ static void render_status(int page)
         fb_draw_string(2, (ap_ssid != NULL && ap_ssid[0] != '\0') ? ap_ssid : "NO AP");
 
         fb_draw_string_2x(2, "UP");
+#if CONFIG_ETH_UPLINK
+        fb_draw_string(6, ap_connect ? "CONNECTED" : "NO UPLINK");
+#else
         fb_draw_string(6, (ssid != NULL && ssid[0] != '\0') ? ssid : "NO UPLINK");
+#endif
 
         fb_draw_string(7, "Page 1/2");
     } else {

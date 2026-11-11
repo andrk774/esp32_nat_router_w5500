@@ -24,6 +24,10 @@
 #include "esp_vfs_dev.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#if CONFIG_ETH_UPLINK && CONFIG_ETH_PHY_SPI_W5500
+#include "driver/spi_master.h"
+#include "esp_mac.h"
+#endif
 #include "driver/uart_vfs.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
@@ -41,6 +45,10 @@
 #endif
 #if CONFIG_ETH_UPLINK
 #include "esp_eth.h"
+#endif
+#if CONFIG_USB_MODEM_UPLINK
+#include "iot_eth.h"
+#include "usb_modem_uplink.h"
 #endif
 
 #include "lwip/opt.h"
@@ -137,6 +145,7 @@ char* vpn_dns = NULL;
 bool vpn_connected = false;
 uint32_t vpn_tunnel_ip = 0;         // Cached VPN tunnel IP (network byte order)
 int32_t vpn_killswitch = 1;         // Kill switch default on
+int32_t vpn_proto = 0;              // 0 = WireGuard, 1 = AmneziaWG
 int32_t vpn_route_all = 1;          // Route all traffic through VPN (default on)
 
 /* FreeRTOS event group to signal when we are connected*/
@@ -326,12 +335,19 @@ static void initialize_console(void)
 #else
 #define BOOT_BUTTON_GPIO      0
 #endif
+// BOOT button factory reset: off for the RMII Ethernet path (GPIO0 carries the
+// RMII clock on WT32-ETH01), on for WiFi uplink, SPI W5500 and USB modem builds.
+#if !CONFIG_ETH_UPLINK || !CONFIG_ETH_PHY_RMII_LAN8720
+#define FACTORY_RESET_BUTTON  1
+#else
+#define FACTORY_RESET_BUTTON  0
+#endif
 #define FACTORY_RESET_HOLD_MS 5000
 #define POLL_INTERVAL_MS      50
 
 void * led_status_thread(void * p)
 {
-#if !CONFIG_ETH_UPLINK
+#if FACTORY_RESET_BUTTON
     // Init boot button for factory reset detection (GPIO0 used by ETH clock on WT32-ETH01)
     gpio_reset_pin(BOOT_BUTTON_GPIO);
     gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
@@ -368,7 +384,7 @@ void * led_status_thread(void * p)
                 led_strip_status_update();
             }
 
-#if !CONFIG_ETH_UPLINK
+#if FACTORY_RESET_BUTTON
             if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
                 held_ms += POLL_INTERVAL_MS;
                 // Rapid LED toggle for visual feedback during hold
@@ -417,25 +433,51 @@ void * led_status_thread(void * p)
 /* Event handlers */
 
 #if CONFIG_ETH_UPLINK
+static void uplink_lost(const char *why)
+{
+    ESP_LOGI(TAG, "Uplink down (%s)", why);
+    if (vpn_connected) {
+        vpn_disconnect();
+    }
+    ap_connect = false;
+    xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+}
+
 static void eth_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data)
 {
+#if CONFIG_USB_MODEM_UPLINK
+    if (event_base == IOT_ETH_EVENT) {
+        // Link events of the USB modem driver (device plugged/enumerated)
+        if (event_id == IOT_ETH_EVENT_CONNECTED) {
+            ESP_LOGI(TAG, "USB modem attached");
+        } else if (event_id == IOT_ETH_EVENT_DISCONNECTED) {
+            uplink_lost("USB modem detached");
+        } else if (event_id == IOT_ETH_EVENT_START) {
+            ESP_LOGI(TAG, "USB modem driver started");
+        }
+        return;
+    }
+    if (event_base == IP_EVENT && event_id == IP_EVENT_PPP_LOST_IP) {
+        uplink_lost("PPP lost IP");
+        return;
+    }
+#else
     if (event_base == ETH_EVENT) {
         if (event_id == ETHERNET_EVENT_CONNECTED) {
             ESP_LOGI(TAG, "Ethernet link up");
         } else if (event_id == ETHERNET_EVENT_DISCONNECTED) {
-            ESP_LOGI(TAG, "Ethernet link down");
-            if (vpn_connected) {
-                vpn_disconnect();
-            }
-            ap_connect = false;
-            xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+            uplink_lost("Ethernet link down");
         } else if (event_id == ETHERNET_EVENT_START) {
             ESP_LOGI(TAG, "Ethernet started");
         }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
+        return;
+    }
+#endif
+    if (event_base == IP_EVENT &&
+        (event_id == IP_EVENT_ETH_GOT_IP || event_id == IP_EVENT_PPP_GOT_IP)) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "ETH got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Uplink got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         ap_connect = true;
         my_ip = event->ip_info.ip.addr;
         delete_portmap_tab();
@@ -869,7 +911,81 @@ void eth_init(const char* static_ip, const char* subnet_mask, const char* gatewa
     esp_netif_init();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // --- Ethernet uplink ---
+    // --- Uplink device ---
+#if CONFIG_USB_MODEM_UPLINK
+    // USB 4G modem on the chip's USB OTG port (PPP or RNDIS/ECM network card).
+    // For RNDIS/ECM the netif exists right away; for PPP it is created when
+    // the modem is started at the end of this function.
+    ESP_ERROR_CHECK(usb_modem_uplink_init(&ethNetif));
+    if (ethNetif != NULL) {
+        esp_netif_set_hostname(ethNetif, hostname);  // DHCP option 12 towards the modem
+    }
+    if (strlen(static_ip) > 0) {
+        ESP_LOGW(TAG, "Static uplink IP is ignored for the USB modem uplink");
+    }
+    ESP_ERROR_CHECK(esp_event_handler_register(IOT_ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_LOST_IP, &eth_event_handler, NULL));
+#else
+#if CONFIG_ETH_PHY_SPI_W5500
+    // External WIZnet W5500 over SPI (e.g. Waveshare ESP32-S3-ETH: no built-in
+    // RMII EMAC on S3, so the MAC+PHY both live in this one SPI chip).
+    spi_bus_config_t spi_bus_cfg = {
+        .miso_io_num = CONFIG_ETH_SPI_MISO_GPIO,
+        .mosi_io_num = CONFIG_ETH_SPI_MOSI_GPIO,
+        .sclk_io_num = CONFIG_ETH_SPI_SCLK_GPIO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(CONFIG_ETH_SPI_HOST, &spi_bus_cfg, SPI_DMA_CH_AUTO));
+
+#if CONFIG_ETH_SPI_RST_GPIO >= 0
+    // Pulse the W5500's hardware reset before the driver talks to it - some
+    // boards power up with the chip left in an unknown state otherwise.
+    gpio_config_t eth_rst_cfg = {
+        .pin_bit_mask = (1ULL << CONFIG_ETH_SPI_RST_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&eth_rst_cfg);
+    gpio_set_level(CONFIG_ETH_SPI_RST_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(CONFIG_ETH_SPI_RST_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+#endif
+
+    // The W5500 driver hooks its INT pin via gpio_isr_handler_add(), which
+    // needs the shared GPIO ISR service. Another module may have installed
+    // it already - ESP_ERR_INVALID_STATE just means that.
+    esp_err_t isr_err = gpio_install_isr_service(0);
+    if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(isr_err);
+    }
+
+    // ESP-IDF 5.x: the W5500 driver adds the SPI device to the bus itself and
+    // sets command_bits/address_bits on its own - pass only the device config.
+    spi_device_interface_config_t spi_dev_cfg = {
+        .mode = 0,
+        .clock_speed_hz = CONFIG_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
+        .spics_io_num = CONFIG_ETH_SPI_CS_GPIO,
+        .queue_size = 20,
+    };
+    eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(CONFIG_ETH_SPI_HOST, &spi_dev_cfg);
+    w5500_config.int_gpio_num = CONFIG_ETH_SPI_INT_GPIO;
+
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
+
+    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+    phy_config.phy_addr = 1;        // fixed inside the W5500, not board-configurable
+    phy_config.reset_gpio_num = -1; // reset already pulsed above via plain GPIO
+    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_config);
+
+    if (mac == NULL || phy == NULL) {
+        ESP_LOGE(TAG, "W5500 MAC/PHY create failed (mac=%p phy=%p) - check SPI wiring/pins", mac, phy);
+        ESP_ERROR_CHECK(ESP_FAIL);
+    }
+#else
     // Power on LAN8720 PHY via GPIO16 before EMAC init (WT32-ETH01)
 #if CONFIG_ETH_PHY_POWER_GPIO >= 0
     gpio_config_t phy_power_cfg = {
@@ -896,9 +1012,18 @@ void eth_init(const char* static_ip, const char* subnet_mask, const char* gatewa
     // phy_config.reset_gpio_num = CONFIG_ETH_PHY_POWER_GPIO;
     phy_config.reset_gpio_num = -1;  // Don't use PHY reset - we handle power via GPIO above
     esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_config);
+#endif // CONFIG_ETH_PHY_SPI_W5500
 
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
+
+#if CONFIG_ETH_PHY_SPI_W5500
+    // SPI Ethernet chips have no factory-programmed MAC - without this the
+    // W5500 comes up as 00:00:00:00:00:00. Use the ESP32's own ETH MAC slot.
+    uint8_t eth_mac_addr[6];
+    ESP_ERROR_CHECK(esp_read_mac(eth_mac_addr, ESP_MAC_ETH));
+    ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, eth_mac_addr));
+#endif
 
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     ethNetif = esp_netif_new(&netif_cfg);
@@ -930,6 +1055,8 @@ void eth_init(const char* static_ip, const char* subnet_mask, const char* gatewa
     // Register ETH events
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_event_handler, NULL));
+
+#endif // CONFIG_USB_MODEM_UPLINK
 
     // --- WiFi AP only ---
     wifiAP = esp_netif_create_default_wifi_ap();
@@ -987,9 +1114,23 @@ void eth_init(const char* static_ip, const char* subnet_mask, const char* gatewa
     } else {
         ESP_LOGI(TAG, "AP interface disabled at boot");
     }
+#if CONFIG_USB_MODEM_UPLINK
+    // Starting the link only now matches the Ethernet path: GOT_IP must not
+    // arrive before the AP netif and DHCP server are configured.
+    esp_err_t modem_err = usb_modem_uplink_start();
+    if (modem_err != ESP_OK) {
+        // Keep the AP and web UI up so the router stays reachable for config.
+        ESP_LOGE(TAG, "USB modem start failed: %s", esp_err_to_name(modem_err));
+    }
+    if (ethNetif == NULL) {
+        ethNetif = usb_modem_uplink_netif();  // PPP netif exists only after start
+    }
+    ESP_LOGI(TAG, "%s-to-WiFi NAT Router initialized", usb_modem_uplink_name());
+#else
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
 
     ESP_LOGI(TAG, "Ethernet-to-WiFi NAT Router initialized");
+#endif
 }
 #else
 void wifi_init(const uint8_t* mac, const char* ssid, const char* ent_username, const char* ent_identity, const char* passwd, const char* static_ip, const char* subnet_mask, const char* gateway_addr, const uint8_t* ap_mac, const char* ap_ssid, const char* ap_passwd, const char* ap_ip)
@@ -1276,6 +1417,17 @@ void app_main(void)
     initialize_nvs();
     load_log_level();  // Apply saved log level early
 
+    {
+        extern const char *reset_reason_str(esp_reset_reason_t reason);
+        esp_reset_reason_t reason = esp_reset_reason();
+        if (reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT || reason == ESP_RST_TASK_WDT ||
+            reason == ESP_RST_WDT || reason == ESP_RST_BROWNOUT) {
+            ESP_LOGW(TAG, "Last reset: %s", reset_reason_str(reason));
+        } else {
+            ESP_LOGI(TAG, "Last reset: %s", reset_reason_str(reason));
+        }
+    }
+
     /* Restore timezone from NVS */
     {
         char *tz = NULL;
@@ -1382,6 +1534,8 @@ void app_main(void)
     int led_strip_gpio_setting = -1;
     if (get_config_param_int("ls_gpio", &led_strip_gpio_setting) == ESP_OK) {
         led_strip_gpio = led_strip_gpio_setting;
+    } else {
+        led_strip_gpio = CONFIG_DEFAULT_LED_STRIP_GPIO;
     }
 
     // Antenna (RF) switch: select pin, optional enable pin and the selected
@@ -1580,6 +1734,10 @@ void app_main(void)
     int vpn_ks_setting = 1;  // Default on
     if (get_config_param_int("vpn_ks", &vpn_ks_setting) == ESP_OK) {
         vpn_killswitch = (int32_t)vpn_ks_setting;
+    }
+    int vpn_proto_setting = 0;
+    if (get_config_param_int("vpn_proto", &vpn_proto_setting) == ESP_OK) {
+        vpn_proto = (int32_t)vpn_proto_setting;
     }
     int vpn_rall_setting = 1;  // Default: route all through VPN
     if (get_config_param_int("vpn_rall", &vpn_rall_setting) == ESP_OK) {

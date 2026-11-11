@@ -1,0 +1,32 @@
+# Waveshare ESP32-S3-ETH / ESP32-S3-POE-ETH(-M) hardware: ESP32-S3R8 with 8 MB
+# octal PSRAM, W25Q128 16 MB flash, WS2812 RGB LED on GPIO21.
+# Chain this LAST in SDKCONFIG_DEFAULTS. Don't use it on other boards: a smaller
+# flash won't boot with this partition table.
+
+# Flash and partition table
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_16mb.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_16mb.csv"
+
+# 8 MB octal PSRAM. Boots without it rather than crash-looping.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+# Let WiFi and lwIP buffers live in PSRAM, so more packets can be queued
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+
+# RGB LED and client limit
+CONFIG_DEFAULT_LED_STRIP_GPIO=21
+# The Wi-Fi driver allows 10 soft-AP clients here (the rest is reserved for ESP-NOW)
+CONFIG_ROUTER_AP_MAX_CONNECTIONS=10
+
+# Keep a core dump in flash after a crash (partition "coredump")
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y

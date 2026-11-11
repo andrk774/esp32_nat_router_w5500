@@ -1,0 +1,32 @@
+# ESP32-S3: USB 4G modem as uplink, plugged into the chip's native USB port
+# (GPIO19 = D-, GPIO20 = D+), which becomes a USB *host*.
+#
+# Chain it with ONE of sdkconfig.defaults.usb_modem_ppp / _net, and do NOT
+# chain sdkconfig.defaults.esp32s3: that one puts the console on the native
+# USB port, which the modem now owns.
+#
+#   idf.py -B build_s3_modem -D IDF_TARGET=esp32s3 -D SDKCONFIG=sdkconfig.s3_modem \
+#     -D EXTRA_COMPONENT_DIRS=usb_modem_components \
+#     -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3_usb_modem;sdkconfig.defaults.usb_modem_net" \
+#     build
+
+# Uplink: "Ethernet / USB modem" branch (WiFi runs as AP only)
+CONFIG_ETH_UPLINK=y
+
+# Console on UART0: TX = GPIO43, RX = GPIO44 (115200 8N1). Use a 3.3 V
+# USB-UART adapter (CH340/CP2102) on the board's IO43/IO44/GND pins.
+# Native USB carries the modem, so no secondary USB-Serial-JTAG console.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# USB host settings recommended by Espressif's 4G-module examples
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+CONFIG_USBH_CDC_CONTROL_TRANSFER_BUFFER_SIZE=1025
+
+# PPP support in lwIP: iot_usbh_modem is compiled in both modem builds
+CONFIG_LWIP_PPP_SUPPORT=y
+CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
+CONFIG_LWIP_PPP_PAP_SUPPORT=y
+# ESP-IDF: VJ-compressed headers get dropped by NAPT on a PPP interface
+CONFIG_LWIP_PPP_VJ_HEADER_COMPRESSION=n

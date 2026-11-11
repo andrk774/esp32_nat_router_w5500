@@ -1,0 +1,8 @@
+# USB modem mode 2: modems that enumerate as a USB network card
+# (Huawei E3372h HiLink and similar). Chain after
+# sdkconfig.defaults.esp32s3_usb_modem.
+CONFIG_UPLINK_USB_MODEM_NET=y
+
+# RNDIS fits most HiLink sticks. Switch to ECM for modems that expose CDC-ECM
+# instead (CONFIG_USB_MODEM_NET_ECM=y) - menuconfig: NAT Router Uplink.
+CONFIG_USB_MODEM_NET_RNDIS=y

@@ -4,7 +4,7 @@
 <head>\
 <meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0'>\
 <meta charset='UTF-8'>\
-<title>WireGuard VPN</title>\
+<title>VPN</title>\
 <link rel='icon' href='favicon.png'>\
 </head>\
 <style>\
@@ -39,7 +39,7 @@ small { display: block; color: #888; font-size: 0.85rem; margin-top: 0.5rem; lin
 <div style='display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;'>\
 <div style='display: flex; align-items: center;'>\
 <a href='/' style='display: inline-block; margin-right: 1rem;'><img src='/favicon.png' alt='Home' style='width: 64px; height: 64px; border: none;'></a>\
-<h1 style='margin: 0;'>WireGuard VPN</h1>\
+<h1 style='margin: 0;'>VPN</h1>\
 </div>"
 
 #define VPN_CHUNK_MID "\
@@ -56,7 +56,7 @@ setTimeout(\"location.href = '/'\", 10000);\
 /* Import section - paste a standard WireGuard .conf */
 #define VPN_CHUNK_IMPORT "\
 <h2>Import Config</h2>\
-<p style='color:#888; font-size:0.85rem; margin-bottom:0.5rem;'>Paste a WireGuard .conf. The fields below are filled and the device reboots.</p>\
+<p style='color:#888; font-size:0.85rem; margin-bottom:0.5rem;'>Paste a WireGuard or AmneziaWG .conf. The fields below are filled and the device reboots.</p>\
 <textarea id='wgconf' rows='9' placeholder='[Interface]&#10;PrivateKey = ...&#10;Address = 10.2.0.2/32&#10;DNS = 10.2.0.1&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = host:51820&#10;AllowedIPs = 0.0.0.0/0'></textarea>\
 <button type='button' class='ok-button' onclick='importWg()'>Import &amp; Reboot</button>\
 <div id='wgmsg' style='margin-top:0.5rem; font-size:0.9rem;'></div>\

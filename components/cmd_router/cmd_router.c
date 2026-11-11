@@ -24,6 +24,7 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 #include "nvs.h"
+#include "wireguard_awg.h"
 #include "esp_wifi.h"
 
 #include "lwip/ip4_addr.h"
@@ -181,6 +182,26 @@ void preprocess_string(char* str)
 }
 
 /* Keys whose value must never reach the console, the log, or syslog. */
+/* Human-readable esp_reset_reason(), also used by app_main's boot log */
+const char *reset_reason_str(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON:   return "power-on";
+        case ESP_RST_EXT:       return "external pin";
+        case ESP_RST_SW:        return "software restart";
+        case ESP_RST_PANIC:     return "crash (panic) - see core dump";
+        case ESP_RST_INT_WDT:   return "interrupt watchdog";
+        case ESP_RST_TASK_WDT:  return "task watchdog";
+        case ESP_RST_WDT:       return "other watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+        case ESP_RST_BROWNOUT:  return "brownout (supply voltage dropped)";
+        case ESP_RST_SDIO:      return "SDIO";
+        case ESP_RST_USB:       return "USB (reset from the computer)";
+        case ESP_RST_JTAG:      return "JTAG";
+        default:                return "unknown";
+    }
+}
+
 static bool is_secret_param(const char *name)
 {
     static const char *const secrets[] = {
@@ -330,7 +351,63 @@ static char *trim_ws(char *s)
     return s;
 }
 
-/* Parse a standard WireGuard .conf file and persist the mapped vpn_* settings.
+/* AmneziaWG keys of a .conf and the NVS keys they are stored under. The numeric
+ * ones are stored as int, H as text ("n" or "n-m"), I as templates. */
+static const struct {
+    const char *conf_key;
+    const char *nvs_key;
+} awg_keys[] = {
+    {"Jc", "awg_jc"}, {"Jmin", "awg_jmin"}, {"Jmax", "awg_jmax"},
+    {"S1", "awg_s1"}, {"S2", "awg_s2"}, {"S3", "awg_s3"}, {"S4", "awg_s4"},
+    {"H1", "awg_h1"}, {"H2", "awg_h2"}, {"H3", "awg_h3"}, {"H4", "awg_h4"},
+    {"I1", "awg_i1"}, {"I2", "awg_i2"}, {"I3", "awg_i3"}, {"I4", "awg_i4"}, {"I5", "awg_i5"},
+};
+#define AWG_KEY_COUNT (sizeof(awg_keys) / sizeof(awg_keys[0]))
+#define AWG_FIRST_H   7
+#define AWG_FIRST_I   11
+
+static const char *import_error = "";
+
+const char *vpn_import_error(void)
+{
+    return import_error;
+}
+
+/* Parses the AmneziaWG values of a .conf into cfg. false: import_error says why. */
+static bool awg_parse_conf(const char *const *vals, wg_awg_config_t *cfg)
+{
+    uint16_t *numbers[] = {&cfg->jc, &cfg->jmin, &cfg->jmax, &cfg->s1, &cfg->s2, &cfg->s3, &cfg->s4};
+
+    wg_awg_config_init(cfg);
+    for (size_t n = 0; n < AWG_FIRST_H; n++) {
+        if (vals[n] != NULL) {
+            char *end;
+            long value = strtol(vals[n], &end, 10);
+            if (*end != '\0' || value < 0 || value > 65535) {
+                import_error = "Jc, Jmin, Jmax and S1-S4 must be numbers";
+                return false;
+            }
+            *numbers[n] = (uint16_t)value;
+        }
+    }
+    for (size_t n = AWG_FIRST_H; n < AWG_FIRST_I; n++) {
+        if (vals[n] != NULL && !wg_awg_parse_range(vals[n], &cfg->h[n - AWG_FIRST_H])) {
+            import_error = "H1-H4 must be a number or a range like 100-200";
+            return false;
+        }
+    }
+    for (size_t n = AWG_FIRST_I; n < AWG_KEY_COUNT; n++) {
+        cfg->i[n - AWG_FIRST_I] = vals[n];
+    }
+    const char *reason = wg_awg_validate(cfg);
+    if (reason != NULL) {
+        import_error = reason;
+        return false;
+    }
+    return true;
+}
+
+/* Parse a WireGuard or AmneziaWG .conf file and persist the mapped vpn_* settings.
  * Maps [Interface]/[Peer] keys onto this router's existing NVS parameters; see
  * vpn_config.h. Sets vpn_enabled=1 on success. IPv6 addresses are skipped. */
 esp_err_t vpn_import_conf(const char *text)
@@ -344,6 +421,10 @@ esp_err_t vpn_import_conf(const char *text)
     char endpoint_host[128] = "", address_ip[48] = "", netmask[16] = "", dns[128] = "";
     int port = 51820, keepalive = 0, route_all = -1, mtu = 0;
     bool have_port = false;
+    const char *awg_vals[AWG_KEY_COUNT] = {0};  /* point into buf */
+    bool is_awg = false;
+
+    import_error = "need PrivateKey, PublicKey, Endpoint and Address";
 
     char *save = NULL;
     for (char *line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -356,6 +437,17 @@ esp_err_t vpn_import_conf(const char *text)
         char *key = trim_ws(p);
         char *val = trim_ws(eq + 1);
         if (*val == '\0') continue;
+
+        bool matched_awg = false;
+        for (size_t n = 0; n < AWG_KEY_COUNT; n++) {
+            if (strcasecmp(key, awg_keys[n].conf_key) == 0) {
+                awg_vals[n] = val;
+                is_awg = true;
+                matched_awg = true;
+                break;
+            }
+        }
+        if (matched_awg) continue;
 
         if (strcasecmp(key, "PrivateKey") == 0) {
             strlcpy(privkey, val, sizeof(privkey));
@@ -389,13 +481,46 @@ esp_err_t vpn_import_conf(const char *text)
         }
     }
 
-    free(buf);
-
     if (privkey[0] == '\0' || pubkey[0] == '\0' ||
         endpoint_host[0] == '\0' || address_ip[0] == '\0') {
         ESP_LOGE(TAG, "WireGuard import: missing required field (need PrivateKey, PublicKey, Endpoint, Address)");
+        free(buf);
         return ESP_ERR_INVALID_ARG;
     }
+
+    wg_awg_config_t awg_cfg;
+    if (is_awg && !awg_parse_conf(awg_vals, &awg_cfg)) {
+        ESP_LOGE(TAG, "AmneziaWG import: %s", import_error);
+        free(buf);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Nothing is stored until the whole file has been accepted. Old AmneziaWG
+     * values go first, so a shorter config doesn't inherit them. */
+    nvs_handle_t awg_nvs;
+    if (nvs_open(PARAM_NAMESPACE, NVS_READWRITE, &awg_nvs) == ESP_OK) {
+        for (size_t n = 0; n < AWG_KEY_COUNT; n++) {
+            nvs_erase_key(awg_nvs, awg_keys[n].nvs_key);
+        }
+        nvs_commit(awg_nvs);
+        nvs_close(awg_nvs);
+    }
+    if (is_awg) {
+        for (size_t n = 0; n < AWG_KEY_COUNT; n++) {
+            if (awg_vals[n] == NULL) continue;
+            esp_err_t err = (n < AWG_FIRST_H)
+                ? set_config_param_int(awg_keys[n].nvs_key, atoi(awg_vals[n]))
+                : set_config_param_str(awg_keys[n].nvs_key, awg_vals[n]);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "AmneziaWG import: cannot store %s: %s", awg_keys[n].nvs_key, esp_err_to_name(err));
+                import_error = "not enough settings storage (I1-I5 are too long)";
+                free(buf);
+                return ESP_ERR_NO_MEM;
+            }
+        }
+    }
+    free(buf);
+    set_config_param_int("vpn_proto", is_awg ? 1 : 0);
 
     set_config_param_str("vpn_privkey", privkey);
     set_config_param_str("vpn_pubkey", pubkey);
@@ -410,8 +535,8 @@ esp_err_t vpn_import_conf(const char *text)
     if (route_all >= 0) set_config_param_int("vpn_rall", route_all);
     set_config_param_int("vpn_enabled", 1);
 
-    ESP_LOGI(TAG, "WireGuard config imported (endpoint=%s:%d ip=%s dns=%s route_all=%d)",
-             endpoint_host, port, address_ip, dns[0] ? dns : "(none)", route_all);
+    ESP_LOGI(TAG, "%s config imported (endpoint=%s:%d ip=%s dns=%s route_all=%d)",
+             is_awg ? "AmneziaWG" : "WireGuard", endpoint_host, port, address_ip, dns[0] ? dns : "(none)", route_all);
     return ESP_OK;
 }
 
@@ -1509,6 +1634,7 @@ static int show(int argc, char **argv)
         char boot_time_str[32];
         format_boot_time(boot_time_str, sizeof(boot_time_str));
         printf("Uptime: %s (since %s)\n", uptime_str, boot_time_str);
+        printf("Last reset: %s\n", reset_reason_str(esp_reset_reason()));
 
         // Connection status
 #if CONFIG_ETH_UPLINK
@@ -1647,7 +1773,17 @@ static int show(int argc, char **argv)
 
         bool hide_pw = remote_console_is_capturing();
 #if CONFIG_ETH_UPLINK
+#if CONFIG_UPLINK_USB_MODEM_PPP
+        printf("Uplink: USB modem (PPP)\n");
+#elif CONFIG_USB_MODEM_NET_RNDIS
+        printf("Uplink: USB modem (RNDIS)\n");
+#elif CONFIG_USB_MODEM_NET_ECM
+        printf("Uplink: USB modem (ECM)\n");
+#elif CONFIG_ETH_PHY_SPI_W5500
+        printf("Uplink: Ethernet (W5500)\n");
+#else
         printf("Uplink: Ethernet (LAN8720)\n");
+#endif
 #else
         char* ssid = NULL;
         char* ent_username = NULL;
@@ -1789,6 +1925,7 @@ static int show(int argc, char **argv)
         printf("MSS Clamp: %u\n", ap_mss_clamp);
         printf("Path MTU: %u\n", ap_pmtu);
         printf("Kill Switch: %s\n", vpn_killswitch ? "on" : "off");
+        printf("Protocol: %s\n", vpn_proto ? "AmneziaWG" : "WireGuard");
         printf("Route All: %s\n", vpn_route_all ? "yes (all traffic)" : "no (split tunnel)");
 
     } else if (strcmp(type, "routes") == 0) {
@@ -3906,6 +4043,7 @@ static struct {
     struct arg_int *enable;
     struct arg_int *killswitch;
     struct arg_int *route_all;
+    struct arg_int *proto;
     struct arg_end *end;
 } set_vpn_args;
 
@@ -3972,6 +4110,9 @@ static int set_vpn_cmd(int argc, char **argv)
     if (set_vpn_args.route_all->count > 0) {
         nvs_set_i32(nvs, "vpn_rall", set_vpn_args.route_all->ival[0]);
     }
+    if (set_vpn_args.proto->count > 0) {
+        nvs_set_i32(nvs, "vpn_proto", set_vpn_args.proto->ival[0] ? 1 : 0);
+    }
 
     nvs_commit(nvs);
     nvs_close(nvs);
@@ -3994,6 +4135,7 @@ static void register_set_vpn(void)
     set_vpn_args.enable    = arg_int0("e", "enable", "<0|1>", "Enable/disable VPN");
     set_vpn_args.killswitch = arg_int0("K", "killswitch", "<0|1>", "Kill switch: block internet when VPN down (default on)");
     set_vpn_args.route_all = arg_int0("R", "route-all", "<0|1>", "Route all traffic through VPN (0=split tunnel)");
+    set_vpn_args.proto     = arg_int0("P", "protocol", "<0|1>", "0=WireGuard, 1=AmneziaWG (import its .conf in the web UI)");
     set_vpn_args.end       = arg_end(4);
 
     const esp_console_cmd_t cmd = {
